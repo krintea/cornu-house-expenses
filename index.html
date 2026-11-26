@@ -72,6 +72,18 @@ summary:focus-visible{outline:3px solid #3486ce;outline-offset:-4px}
 .filter-empty{display:flex;flex-direction:column;align-items:center;gap:10px}
 .auto-sync-row{margin:4px 0 6px;font-size:14px;align-items:flex-start}.auto-sync-row input{margin-top:3px;width:18px;height:18px}
 .sync-ok{margin:0 0 12px}
+.doc-drop{margin-bottom:16px}
+.doc-drop-label{display:flex;align-items:center;gap:12px;padding:14px;border:1.5px dashed #9fb6d3;border-radius:12px;background:var(--blueSoft);color:var(--primary);cursor:pointer}
+.doc-drop-label:hover,.doc-drop.dragover .doc-drop-label{border-color:var(--blue);background:#dfeaf8}
+.doc-drop-label span{display:flex;flex-direction:column;gap:3px}.doc-drop-label small{color:#475467;font-size:12px;line-height:1.4}
+#docFile:focus-visible+.doc-drop-label{outline:3px solid #3486ce;outline-offset:2px}
+.doc-drop.busy .doc-drop-label{opacity:.6;pointer-events:none}
+.doc-status{margin-top:8px;padding:10px 12px;border-radius:10px;font-size:13px;line-height:1.45;background:#f8fafc;border:1px solid var(--line)}
+.doc-status.ok{background:var(--greenSoft);border-color:#bfe3cf;color:#256247}.doc-status.warn{background:var(--amberSoft);border-color:#f0d49b;color:#7a4b06}.doc-status.err{background:var(--dangerSoft);border-color:#f4c4bf;color:#8d2118}
+.doc-text{margin-top:6px;font-size:12px}.doc-text summary{cursor:pointer;color:var(--blue);font-weight:700}
+.doc-text pre{white-space:pre-wrap;max-height:220px;overflow:auto;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:10px;font-size:11px}
+.field .autofilled,.field select.autofilled{background:#fffbe6;border-color:#e8c766}
+.field .uncertain{border-color:#d97706;box-shadow:0 0 0 3px rgba(217,119,6,.15)}
 #askDialog{width:min(480px,calc(100vw - 28px))}
 #askMessage{margin-top:0;line-height:1.55}
 @media(max-width:650px){
@@ -149,12 +161,29 @@ summary:focus-visible{outline:3px solid #3486ce;outline-offset:-4px}
 <button id="loadSampleBtn" class="btn">Încarcă datele exemplu</button>
 </div>
 </div>
+<div class="card card-pad card-gap"><h2 class="section-title">Citire automată din documente</h2>
+<p class="settings-note">La „Adaugă plată” poți încărca factura sau bonul (PDF, Word sau poză), iar aplicația completează suma, data, furnizorul și numărul facturii. Verifică întotdeauna valorile înainte de salvare.</p>
+<div class="form-grid">
+<div class="field"><label for="docMethod">Metodă de citire</label><select id="docMethod"><option value="local">Local, în browser (gratuit, documentele nu pleacă de pe dispozitiv)</option><option value="claude">Claude AI (mai precis, necesită cheie API Anthropic)</option></select></div>
+<div class="field claude-only"><label for="docModel">Model Claude</label><select id="docModel"><option value="claude-haiku-5-5">Claude Haiku 5.5 (rapid, cost redus)</option><option value="claude-sonnet-5-5">Claude Sonnet 5.5 (cel mai precis)</option></select></div>
+<div class="field span-2 claude-only"><label for="docApiKey">Cheie API Anthropic</label><input id="docApiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…"></div>
+</div>
+<p class="settings-note claude-only" style="margin-top:10px">Cheia rămâne doar în acest browser (nu intră în backup sau în Drive). Documentele încărcate sunt trimise la Anthropic pentru citire, iar costul se facturează în contul tău Anthropic. Dacă Claude nu răspunde, se folosește automat citirea locală. Cheia se creează în console.anthropic.com.</p>
+<div class="btn-row" style="margin-top:6px"><button id="saveDocSettings" class="btn btn-primary">Salvează</button><button id="testDocKey" class="btn claude-only">Testează cheia</button></div>
+<p id="docSettingsStatus" class="settings-note" role="status" style="margin-top:10px"></p>
+</div>
 </section>
 </main>
 
 <dialog id="paymentDialog" aria-labelledby="paymentDialogTitle"><form id="paymentForm" novalidate>
 <div class="dialog-head"><h2 id="paymentDialogTitle">Adaugă plată</h2><button type="button" class="btn btn-icon" data-close-dialog="paymentDialog" aria-label="Închide">×</button></div>
 <div class="dialog-body"><input id="paymentId" type="hidden">
+<div id="docDrop" class="doc-drop">
+<input id="docFile" type="file" class="sr-only" accept=".pdf,.docx,image/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+<label for="docFile" class="doc-drop-label"><svg aria-hidden="true" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 18v-6M9.5 14.5 12 12l2.5 2.5"/></svg><span><strong>Încarcă factura sau bonul</strong><small>PDF, Word (.docx) sau poză. Completăm automat suma, data, furnizorul și nr. facturii.</small></span></label>
+<div id="docStatus" class="doc-status hidden" role="status"></div>
+<details id="docTextBox" class="doc-text hidden"><summary>Vezi textul citit din document</summary><pre id="docText"></pre></details>
+</div>
 <div class="form-grid">
 <div class="field"><label for="paymentAmount">Sumă</label><input id="paymentAmount" type="number" min="0.01" step="0.01" inputmode="decimal" required></div>
 <div class="field"><label for="paymentCurrency">Monedă</label><select id="paymentCurrency"><option value="RON">RON</option><option value="EUR">EUR</option></select></div>
@@ -196,6 +225,7 @@ summary:focus-visible{outline:3px solid #3486ce;outline-offset:-4px}
 
 <div id="toastWrap" class="toast-wrap" role="status" aria-live="polite"></div>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="docreader.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

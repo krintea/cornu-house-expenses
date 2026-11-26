@@ -419,6 +419,7 @@ function openPaymentDialog(id = null) {
   $("paymentInvoiceNumber").value = p?.invoiceNumber || "";
   $("paymentNotes").value = p?.notes || "";
   $("paymentError").classList.add("hidden");
+  resetDocUpload();
   rateTouched = false; rateSeq++;
   setRateStatus(p ? `Sursa cursului salvat: ${rateSourceLabel(p.rateSource)}${p.rateDate ? ` (${formatDate(p.rateDate)})` : ""}.` : "");
   syncRateBoxToCurrency(); updateRateSummary(); updateConversionPreview(); checkDuplicate();
@@ -777,6 +778,112 @@ function renderSyncBar() {
   }
 }
 
+// ---------- Document upload & automatic field filling ----------
+const DOC_KEY = "cornu-house-expenses-docreader-v1"; // device-only (API key never goes into backups)
+function getDocSettings() { try { return { method: "local", model: "claude-haiku-5-5", apiKey: "", ...JSON.parse(localStorage.getItem(DOC_KEY) || "{}") }; } catch { return { method: "local", model: "claude-haiku-5-5", apiKey: "" }; } }
+function setDocSettings(s) { try { localStorage.setItem(DOC_KEY, JSON.stringify(s)); } catch {} }
+function renderDocSettings() {
+  const s = getDocSettings();
+  $("docMethod").value = s.method; $("docModel").value = s.model; $("docApiKey").value = s.apiKey;
+  toggleClaudeFields();
+}
+function toggleClaudeFields() { const on = $("docMethod").value === "claude"; document.querySelectorAll(".claude-only").forEach(e => e.classList.toggle("hidden", !on)); }
+function saveDocSettingsFromForm() {
+  const method = $("docMethod").value, apiKey = $("docApiKey").value.trim();
+  if (method === "claude" && !apiKey) { $("docSettingsStatus").textContent = "Introdu cheia API pentru a folosi Claude."; return; }
+  setDocSettings({ method, model: $("docModel").value, apiKey });
+  $("docSettingsStatus").textContent = method === "claude" ? "Salvat. Documentele vor fi citite cu Claude." : "Salvat. Documentele vor fi citite local, în browser.";
+}
+async function testDocKey() {
+  const key = $("docApiKey").value.trim();
+  if (!key) { $("docSettingsStatus").textContent = "Introdu mai întâi cheia API."; return; }
+  $("docSettingsStatus").textContent = "Se testează…"; $("testDocKey").disabled = true;
+  try { await window.DocReader.testClaudeKey(key, $("docModel").value); $("docSettingsStatus").textContent = "Cheia funcționează. Apasă „Salvează” ca să o folosești."; }
+  catch (e) { $("docSettingsStatus").textContent = e.message; }
+  finally { $("testDocKey").disabled = false; }
+}
+
+const touchedFields = new Set();
+const AUTO_FIELDS = ["paymentAmount", "paymentCurrency", "paymentDate", "paymentBeneficiary", "paymentDescription", "paymentCategory", "paymentInvoiceNumber", "paymentNotes"];
+function resetDocUpload() {
+  touchedFields.clear(); docSeq++;
+  AUTO_FIELDS.forEach(id => $(id).classList.remove("autofilled", "uncertain"));
+  $("docStatus").className = "doc-status hidden"; $("docStatus").textContent = "";
+  $("docTextBox").classList.add("hidden"); $("docTextBox").open = false; $("docText").textContent = "";
+  $("docDrop").classList.remove("busy"); $("docFile").value = "";
+}
+function setDocStatus(text, cls = "") { const e = $("docStatus"); e.className = `doc-status ${cls}`; e.textContent = text; }
+function lastCategoryFor(beneficiary) {
+  const b = fold(beneficiary); const p = [...state.payments].filter(x => fold(x.beneficiary) === b).sort((a, c) => c.date.localeCompare(a.date))[0];
+  return p?.categoryId || null;
+}
+function fold(s) { return String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim(); }
+
+let docSeq = 0;
+async function handleDocument(file) {
+  if (!file) return;
+  const seq = ++docSeq, ds = getDocSettings();
+  $("docDrop").classList.add("busy");
+  setDocStatus(`Se citește „${file.name}”…`);
+  try {
+    const res = await window.DocReader.readDocument(file, {
+      method: ds.method, apiKey: ds.apiKey, model: ds.model,
+      categories: getSortedCategories().map(c => c.name),
+      beneficiaries: [...new Set(state.payments.map(p => p.beneficiary))],
+      onProgress: msg => { if (seq === docSeq) setDocStatus(msg); }
+    });
+    if (seq !== docSeq || !$("paymentDialog").open) return;
+    applyExtracted(res, file);
+  } catch (e) {
+    if (seq === docSeq) setDocStatus(`Documentul nu a putut fi citit: ${e.message}`, "err");
+  } finally { if (seq === docSeq) { $("docDrop").classList.remove("busy"); $("docFile").value = ""; } }
+}
+function applyExtracted(res, file) {
+  const f = res.fields, filled = [], missing = [];
+  const set = (id, value, label) => {
+    if (value == null || value === "") { missing.push(label); return; }
+    if (touchedFields.has(id)) return; // never overwrite what the user typed
+    $(id).value = value; $(id).classList.add("autofilled"); filled.push(label);
+    $(id).classList.toggle("uncertain", (f.uncertain || []).includes(id.replace("payment", "").toLowerCase()));
+  };
+  const oldDate = $("paymentDate").value;
+  set("paymentAmount", f.amount != null ? Number(f.amount).toFixed(2) : null, "suma");
+  set("paymentCurrency", f.currency, "moneda");
+  set("paymentDate", f.date, "data");
+  set("paymentBeneficiary", f.beneficiary, "furnizorul");
+  set("paymentInvoiceNumber", f.invoiceNumber, "nr. facturii");
+  if (f.description) set("paymentDescription", f.description, "descrierea");
+  // Category: Claude's suggestion, otherwise the category last used for this supplier.
+  const byName = f.category && getSortedCategories().find(c => fold(c.name) === fold(f.category));
+  const catId = byName?.id || (f.beneficiary && lastCategoryFor(f.beneficiary));
+  if (catId && !touchedFields.has("paymentCategory") && $("paymentCategory").value !== catId) { $("paymentCategory").value = catId; renderPaymentSubcategoryOptions(catId); $("paymentCategory").classList.add("autofilled"); filled.push("categoria"); }
+  if (!touchedFields.has("paymentNotes") && !$("paymentNotes").value.trim()) { $("paymentNotes").value = `Document: ${file.name}`; }
+  syncRateBoxToCurrency(); updateConversionPreview(); checkDuplicate(); updateRateSummary();
+  if (!$("paymentId").value && $("paymentDate").value !== oldDate) autoFetchRate($("paymentDate").value);
+  const how = res.method === "claude" ? "Citit cu Claude" : res.ocr ? "Citit local (recunoaștere text din imagine)" : "Citit local";
+  const parts = [`${how}.`];
+  if (filled.length) parts.push(`Am completat: ${filled.join(", ")}.`);
+  const realMissing = missing.filter(m => m !== "descrierea");
+  if (realMissing.length) parts.push(`Nu am găsit: ${realMissing.join(", ")}.`);
+  if ((f.uncertain || []).length) parts.push("Câmpurile cu chenar portocaliu sunt nesigure.");
+  parts.push("Verifică valorile marcate înainte de salvare.");
+  if (res.warning) parts.unshift(res.warning);
+  setDocStatus(parts.join(" "), !filled.length ? "err" : realMissing.length || res.warning || (f.uncertain || []).length ? "warn" : "ok");
+  if (res.text) { $("docText").textContent = res.text.slice(0, 20000); $("docTextBox").classList.remove("hidden"); }
+}
+function bindDocEvents() {
+  $("docFile").addEventListener("change", e => handleDocument(e.target.files[0]));
+  const drop = $("docDrop");
+  ["dragenter", "dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("dragover"); }));
+  ["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("dragover"); }));
+  drop.addEventListener("drop", e => handleDocument(e.dataTransfer?.files?.[0]));
+  AUTO_FIELDS.forEach(id => $(id).addEventListener("input", e => { if (!e.isTrusted) return; touchedFields.add(id); $(id).classList.remove("autofilled", "uncertain"); }));
+  AUTO_FIELDS.forEach(id => $(id).addEventListener("change", e => { if (!e.isTrusted) return; touchedFields.add(id); $(id).classList.remove("autofilled", "uncertain"); }));
+  $("docMethod").addEventListener("change", toggleClaudeFields);
+  $("saveDocSettings").addEventListener("click", saveDocSettingsFromForm);
+  $("testDocKey").addEventListener("click", testDocKey);
+}
+
 // ---------- PDF ----------
 function loadScript(src) { return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error(src)); document.head.appendChild(s); }); }
 let pdfLibPromise = null, pdfFontCache = null;
@@ -867,6 +974,7 @@ async function generatePdf() {
 
 // ---------- Events ----------
 function bindEvents() {
+  bindDocEvents();
   document.addEventListener("click", e => {
     const t = e.target, attr = (sel, key) => t.closest(sel)?.dataset[key];
     const pg = attr("[data-page]", "page"); if (pg) { e.preventDefault(); showPage(pg); return; }
@@ -903,7 +1011,7 @@ function bindEvents() {
   });
   $("fetchRateBtn").addEventListener("click", () => autoFetchRate($("paymentDate").value, { userInitiated: true }));
   $("paymentForm").addEventListener("submit", savePaymentFromForm);
-  $("paymentDialog").addEventListener("close", () => { rateSeq++; });
+  $("paymentDialog").addEventListener("close", () => { rateSeq++; docSeq++; });
   $("addCategoryBtn").addEventListener("click", addCategory);
   $("saveSettingsBtn").addEventListener("click", saveSettingsFromForm);
   $("exportJsonBtn").addEventListener("click", exportBackup);
@@ -924,6 +1032,7 @@ function bindEvents() {
 
 function init() {
   bindEvents();
+  renderDocSettings();
   // Migrate stored data to schema v2 once (without counting it as a user change).
   if (localStorage.getItem(STORAGE_KEY) && !loadProblem) saveState({ countAsChange: false });
   renderAll();
