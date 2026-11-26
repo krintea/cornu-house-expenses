@@ -156,7 +156,7 @@ function markBackup(kind) { setBackupMeta({ at: nowIso(), changes: 0, kind }); }
 function saveState({ countAsChange = true } = {}) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    if (countAsChange) { const m = getBackupMeta(); m.changes = (m.changes || 0) + 1; setBackupMeta(m); }
+    if (countAsChange) { const m = getBackupMeta(); m.changes = (m.changes || 0) + 1; setBackupMeta(m); scheduleAutoSync(); }
     return true;
   } catch {
     toast("Nu s-a putut salva în browser (spațiu plin sau stocare blocată). Fă un backup acum.");
@@ -231,7 +231,7 @@ function renderBackupBanners() {
   const b = backupHealth();
   const problem = loadProblem ? `<div class="danger-note" style="margin-bottom:12px">${h(loadProblem)}</div>` : "";
   let html = "";
-  if (b.level === "warn") html = `<div class="warning backup-banner"><span>${h(b.text)}</span><div class="actions"><button class="btn btn-small" data-action="drive-save">Salvează în Drive</button><button class="btn btn-small" data-action="export-json">Export JSON</button></div></div>`;
+  if (b.level === "warn" && !getSync().enabled) html = `<div class="warning backup-banner"><span>${h(b.text)}</span><div class="actions"><button class="btn btn-small" data-action="drive-save">Salvează în Drive</button><button class="btn btn-small" data-action="export-json">Export JSON</button></div></div>`;
   else if (b.level === "ok") html = `<p class="backup-ok">${h(b.text)}</p>`;
   $("dashBackup").innerHTML = problem + html;
   $("settingsBackupStatus").innerHTML = (problem) + (b.text ? `<span class="${b.level === "warn" ? "neg" : ""}">${h(b.text)}</span>` : "Nu există încă date de salvat.");
@@ -612,28 +612,37 @@ function exportCsv() {
   toast("Fișierul CSV a fost exportat.");
 }
 
-// ---------- Google Drive ----------
-let driveToken = null, driveConsented = false;
-function driveAuthorize(force = false) {
-  if (!force && driveToken && Date.now() < driveToken.exp - 60000) return Promise.resolve(driveToken.value);
+// ---------- Google Drive (manual + automatic save) ----------
+const SYNC_KEY = "cornu-house-expenses-sync-v1";
+const AUTO_SYNC_DELAY = 2000;
+const codeErr = (code, msg) => Object.assign(new Error(msg), { code });
+function getSync() { try { return { enabled: false, modified: null, consented: false, ...JSON.parse(localStorage.getItem(SYNC_KEY) || "{}") }; } catch { return { enabled: false, modified: null, consented: false }; } }
+function setSync(patch) { const s = { ...getSync(), ...patch }; try { localStorage.setItem(SYNC_KEY, JSON.stringify(s)); } catch {} return s; }
+
+let driveToken = null, driveSilent = false;
+function hasDriveToken() { return !!(driveToken && Date.now() < driveToken.exp - 60000); }
+function driveAuthorize() {
+  if (hasDriveToken()) return Promise.resolve(driveToken.value);
+  // Background saves must never open a Google pop-up (browsers block pop-ups without a tap).
+  if (driveSilent) return Promise.reject(codeErr("auth", "Este nevoie de reconectare la Google Drive."));
   return new Promise((resolve, reject) => {
     const oauth = window.google?.accounts?.oauth2;
     if (!oauth) return reject(new Error("Serviciul Google nu este disponibil. Verifică conexiunea și reîncarcă pagina."));
     const client = oauth.initTokenClient({
       client_id: DRIVE_CLIENT_ID, scope: DRIVE_SCOPE, include_granted_scopes: false,
       callback: r => {
-        if (r.access_token && oauth.hasGrantedAllScopes(r, DRIVE_SCOPE)) { driveConsented = true; driveToken = { value: r.access_token, exp: Date.now() + (Number(r.expires_in) || 3600) * 1000 }; resolve(r.access_token); }
+        if (r.access_token && oauth.hasGrantedAllScopes(r, DRIVE_SCOPE)) { setSync({ consented: true }); driveToken = { value: r.access_token, exp: Date.now() + (Number(r.expires_in) || 3600) * 1000 }; resolve(r.access_token); }
         else reject(new Error("Accesul la Drive nu a fost acordat."));
       },
       error_callback: () => reject(new Error("Conectarea la Google a fost întreruptă."))
     });
-    client.requestAccessToken(driveConsented ? { prompt: "" } : {});
+    client.requestAccessToken(getSync().consented ? { prompt: "" } : {});
   });
 }
 async function driveRequest(path, options = {}, retry = true) {
   const token = await driveAuthorize();
   const r = await fetch("https://www.googleapis.com/" + path, { ...options, headers: { ...options.headers, Authorization: "Bearer " + token } });
-  if (r.status === 401 && retry) { driveToken = null; return driveRequest(path, options, false); }
+  if (r.status === 401) { driveToken = null; if (retry && !driveSilent) return driveRequest(path, options, false); throw codeErr("auth", "Sesiunea Google a expirat."); }
   if (!r.ok) throw new Error("Google Drive: eroare HTTP " + r.status);
   return r;
 }
@@ -641,49 +650,131 @@ async function driveListBackups() {
   const q = new URLSearchParams({ spaces: "appDataFolder", q: `trashed = false and name = '${DRIVE_FILE}'`, fields: "files(id,modifiedTime)", orderBy: "modifiedTime desc", pageSize: "100" });
   return (await (await driveRequest("drive/v3/files?" + q)).json()).files || [];
 }
-async function driveSave() {
+const remoteChanged = files => files.length > 0 && files[0].modifiedTime !== getSync().modified;
+
+/** Writes the current state to the single Drive file. With checkConflict, refuses to overwrite a copy saved from another device. */
+async function driveSave({ checkConflict = false } = {}) {
   const body = JSON.stringify({ ...state, exportedAt: nowIso() });
   const files = await driveListBackups();
-  let id;
+  if (checkConflict && remoteChanged(files)) throw codeErr("conflict", "Copia din Drive a fost modificată de pe alt dispozitiv.");
+  let saved;
   if (files.length) {
-    id = files[0].id;
-    await driveRequest(`upload/drive/v3/files/${encodeURIComponent(id)}?uploadType=media&fields=id`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body });
+    saved = await (await driveRequest(`upload/drive/v3/files/${encodeURIComponent(files[0].id)}?uploadType=media&fields=id,modifiedTime`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body })).json();
   } else {
     const boundary = "cornu-" + uid("b");
     const meta = JSON.stringify({ name: DRIVE_FILE, parents: ["appDataFolder"], mimeType: "application/json" });
     const multipart = [`--${boundary}`, "Content-Type: application/json; charset=UTF-8", "", meta, `--${boundary}`, "Content-Type: application/json", "", body, `--${boundary}--`, ""].join("\r\n");
-    id = (await (await driveRequest("upload/drive/v3/files?uploadType=multipart&fields=id", { method: "POST", headers: { "Content-Type": `multipart/related; boundary=${boundary}` }, body: multipart })).json()).id;
+    saved = await (await driveRequest("upload/drive/v3/files?uploadType=multipart&fields=id,modifiedTime", { method: "POST", headers: { "Content-Type": `multipart/related; boundary=${boundary}` }, body: multipart })).json();
   }
-  const check = await (await driveRequest(`drive/v3/files/${encodeURIComponent(id)}?alt=media`)).text();
+  const check = await (await driveRequest(`drive/v3/files/${encodeURIComponent(saved.id)}?alt=media`)).text();
   if (check !== body) throw new Error("Copia din Drive nu a putut fi verificată.");
+  setSync({ modified: saved.modifiedTime });
   // Earlier versions created a new file on every save: keep only the newest few.
   for (const f of files.slice(DRIVE_KEEP)) { try { await driveRequest(`drive/v3/files/${encodeURIComponent(f.id)}`, { method: "DELETE" }); } catch {} }
   markBackup("drive");
   return "Copie salvată și verificată în Drive.";
 }
-async function driveLoad() {
+async function driveLoad({ confirm = true } = {}) {
   const files = await driveListBackups();
   if (!files.length) throw new Error("Nu există o copie în acest cont Google.");
   let clean;
   try { clean = sanitizeState(await (await driveRequest(`drive/v3/files/${encodeURIComponent(files[0].id)}?alt=media`)).json()); }
   catch (e) { throw new Error(`Copia din Drive nu poate fi folosită: ${e.message}`); }
-  const when = new Date(files[0].modifiedTime).toLocaleString("ro-RO");
-  const ok = await ask({ title: "Restaurezi copia din Drive?", message: `Copia din ${when} conține ${plural(clean.payments.length, "plată", "plăți")}. Datele de pe acest dispozitiv vor fi înlocuite (poți anula imediat după).`, type: "none", okLabel: "Restaurează", danger: true });
-  if (!ok) return "Restaurare anulată.";
+  if (confirm) {
+    const when = new Date(files[0].modifiedTime).toLocaleString("ro-RO");
+    const ok = await ask({ title: "Restaurezi copia din Drive?", message: `Copia din ${when} conține ${plural(clean.payments.length, "plată", "plăți")}. Datele de pe acest dispozitiv vor fi înlocuite (poți anula imediat după).`, type: "none", okLabel: "Restaurează", danger: true });
+    if (!ok) return "Restaurare anulată.";
+  }
   commit(() => { state = clean; }, "Copia din Drive a fost încărcată.", { undo: true });
+  // The local data now equals the Drive copy: nothing to upload.
+  clearTimeout(syncTimer); syncDirty = false;
+  setSync({ modified: files[0].modifiedTime });
   localStorage.setItem(FIRST_RUN_KEY, "1");
   markBackup("drive");
   return "Ultima copie din Drive a fost încărcată.";
 }
 async function runDrive(action) {
-  const buttons = [$("driveSave"), $("driveLoad"), ...document.querySelectorAll('[data-action="drive-save"]')];
+  const buttons = [$("driveSave"), $("driveLoad"), ...document.querySelectorAll('[data-action^="drive-"]')];
   buttons.forEach(b => b.disabled = true);
   $("driveStatus").textContent = "Conectare…";
   try {
     const msg = await (action === "save" ? driveSave() : driveLoad());
     $("driveStatus").textContent = msg; toast(msg);
+    if (getSync().enabled && msg !== "Restaurare anulată.") { syncDirty = false; clearTimeout(syncTimer); setSyncStatus("ok"); }
   } catch (e) { $("driveStatus").textContent = e.message; toast(e.message, { timeout: 6000 }); }
   finally { buttons.forEach(b => b.disabled = false); renderBackupBanners(); }
+}
+
+// --- automatic save ---
+let syncStatus = { state: "idle", msg: "", at: null }, syncTimer = null, syncDirty = false, syncRunning = false;
+function setSyncStatus(st, msg = "") { syncStatus = { state: st, msg, at: st === "ok" ? new Date() : syncStatus.at }; renderSyncBar(); }
+function scheduleAutoSync() {
+  if (!getSync().enabled) return;
+  syncDirty = true;
+  if (syncStatus.state === "conflict") return renderSyncBar();
+  clearTimeout(syncTimer);
+  if (!hasDriveToken()) return setSyncStatus("needs-auth");
+  setSyncStatus("pending");
+  syncTimer = setTimeout(autoSync, AUTO_SYNC_DELAY);
+}
+async function autoSync() {
+  if (!getSync().enabled || !syncDirty) return;
+  if (syncRunning) { clearTimeout(syncTimer); syncTimer = setTimeout(autoSync, 1000); return; }
+  if (!hasDriveToken()) return setSyncStatus("needs-auth");
+  syncRunning = true; syncDirty = false; driveSilent = true;
+  setSyncStatus("saving");
+  try { await driveSave({ checkConflict: true }); setSyncStatus("ok"); }
+  catch (e) {
+    syncDirty = true;
+    setSyncStatus(e.code === "conflict" ? "conflict" : e.code === "auth" ? "needs-auth" : "error", e.message);
+  } finally {
+    syncRunning = false; driveSilent = false; renderBackupBanners();
+    if (syncDirty && syncStatus.state === "ok") scheduleAutoSync(); // changes made while saving
+  }
+}
+/** Tap handler: get a Google token (pop-up allowed), check for newer data from another device, then save. */
+async function connectDrive() {
+  try {
+    await driveAuthorize();
+    setSyncStatus("saving");
+    const files = await driveListBackups();
+    if (remoteChanged(files)) return setSyncStatus("conflict", "Copia din Drive a fost modificată de pe alt dispozitiv.");
+    if (syncDirty || !files.length) { syncDirty = true; await autoSync(); } else setSyncStatus("ok");
+  } catch (e) { setSyncStatus(e.code === "auth" ? "needs-auth" : "error", e.message); }
+}
+function resolveConflict(keep) { return runDrive(keep === "drive" ? "load" : "save"); }
+
+async function setAutoSync(on) {
+  const box = $("autoSyncToggle");
+  if (!on) { setSync({ enabled: false }); clearTimeout(syncTimer); setSyncStatus("idle"); renderBackupBanners(); toast("Salvarea automată în Drive a fost oprită."); return; }
+  try {
+    await driveAuthorize(); // must be the first await: it opens the Google pop-up from this tap
+    const files = await driveListBackups();
+    if (remoteChanged(files)) {
+      const when = new Date(files[0].modifiedTime).toLocaleString("ro-RO");
+      const choice = await ask({ title: "Există deja o copie în Drive", message: `În Drive există o copie din ${when}. Alege ce date păstrezi de acum înainte.`, label: "Păstrează", type: "select", options: [{ value: "local", label: `Datele de pe acest dispozitiv (${plural(state.payments.length, "plată", "plăți")})` }, { value: "drive", label: "Copia din Drive (înlocuiește datele de aici)" }], okLabel: "Continuă" });
+      if (!choice) { box.checked = false; return; }
+      if (choice === "drive") await driveLoad({ confirm: false }); else await driveSave();
+    } else await driveSave();
+    setSync({ enabled: true }); syncDirty = false; setSyncStatus("ok"); renderBackupBanners();
+    toast("Salvarea automată în Drive este pornită.");
+  } catch (e) { box.checked = false; toast(e.message, { timeout: 6000 }); }
+}
+
+function renderSyncBar() {
+  const el = $("syncBar"), s = getSync();
+  if ($("autoSyncToggle")) $("autoSyncToggle").checked = !!s.enabled;
+  if (!s.enabled) { el.innerHTML = ""; return; }
+  const time = syncStatus.at ? syncStatus.at.toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit" }) : "";
+  const btn = (action, label, primary) => `<button class="btn btn-small${primary ? " btn-primary" : ""}" data-action="${action}">${label}</button>`;
+  const bar = (cls, text, buttons = "") => `<div class="${cls} backup-banner sync-bar"><span>${h(text)}</span>${buttons ? `<div class="actions">${buttons}</div>` : ""}</div>`;
+  switch (syncStatus.state) {
+    case "ok": el.innerHTML = `<p class="backup-ok sync-ok">✓ Salvat automat în Google Drive${time ? ` la ${time}` : ""}.</p>`; break;
+    case "pending": case "saving": el.innerHTML = `<p class="backup-ok sync-ok">Se salvează în Google Drive…</p>`; break;
+    case "conflict": el.innerHTML = bar("warning", "Copia din Drive a fost modificată de pe alt dispozitiv. Alege ce date păstrezi; salvarea automată e în pauză până atunci.", btn("drive-keep-drive", "Folosește copia din Drive", true) + btn("drive-keep-local", "Păstrează datele de aici")); break;
+    case "error": el.innerHTML = bar("danger-note", `Salvarea în Drive a eșuat: ${syncStatus.msg} Modificările sunt păstrate în browser.`, btn("drive-connect", "Reîncearcă", true)); break;
+    default: el.innerHTML = bar("warning", syncDirty ? "Ai modificări care nu sunt încă în Google Drive. Conectează-te ca să fie salvate." : "Salvarea automată în Google Drive este pornită. Conectează-te pentru această sesiune.", btn("drive-connect", "Conectează Drive", true));
+  }
 }
 
 // ---------- PDF ----------
@@ -783,6 +874,9 @@ function bindEvents() {
     if (action === "add-payment") return openPaymentDialog();
     if (action === "open-pdf") return openPdfDialog();
     if (action === "drive-save") return runDrive("save");
+    if (action === "drive-connect") return connectDrive();
+    if (action === "drive-keep-drive") return resolveConflict("drive");
+    if (action === "drive-keep-local") return resolveConflict("local");
     if (action === "export-json") return exportBackup();
     if (action === "reset-filters") { Object.assign(filters, { search: "", dateFrom: "", dateTo: "", currency: "ALL" }); return renderPayments(); }
     const cl = attr("[data-close-dialog]", "closeDialog"); if (cl) { if (cl === "paymentDialog") rateSeq++; return $(cl).close(); }
@@ -818,6 +912,10 @@ function bindEvents() {
   $("exportCsvBtn").addEventListener("click", exportCsv);
   $("loadSampleBtn").addEventListener("click", loadSampleData);
   $("driveSave").addEventListener("click", () => runDrive("save"));
+  $("autoSyncToggle").addEventListener("change", e => setAutoSync(e.target.checked));
+  // Flush a pending automatic save when the tab is hidden; warn before closing with unsaved Drive changes.
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden" && syncDirty && hasDriveToken() && syncStatus.state === "pending") { clearTimeout(syncTimer); autoSync(); } });
+  window.addEventListener("beforeunload", e => { if (getSync().enabled && (syncRunning || (syncDirty && hasDriveToken() && syncStatus.state !== "conflict"))) { e.preventDefault(); e.returnValue = ""; } });
   $("driveLoad").addEventListener("click", () => runDrive("load"));
   $("generatePdfBtn").addEventListener("click", generatePdf);
   $("startEmptyBtn").addEventListener("click", () => { state = createEmptyState(); saveState({ countAsChange: false }); localStorage.setItem(FIRST_RUN_KEY, "1"); $("firstRunDialog").close(); renderAll(); });
@@ -829,6 +927,7 @@ function init() {
   // Migrate stored data to schema v2 once (without counting it as a user change).
   if (localStorage.getItem(STORAGE_KEY) && !loadProblem) saveState({ countAsChange: false });
   renderAll();
+  if (getSync().enabled) setSyncStatus("needs-auth"); else renderSyncBar();
   // Ask the browser not to evict our data (helps on Safari/iOS; silently ignored elsewhere).
   try { navigator.storage?.persist?.(); } catch {}
   if (!localStorage.getItem(FIRST_RUN_KEY)) $("firstRunDialog").showModal();

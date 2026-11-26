@@ -5,6 +5,7 @@ Aplicație web statică (GitHub Pages) pentru evidența plăților la construcț
 ## Cum funcționează
 - **Datele stau în browser** (`localStorage`). Nu există server. Fă backup regulat: aplicația afișează un avertisment când ultimul backup e vechi sau au fost multe modificări de atunci.
 - **Backup:** Google Drive (o singură copie în spațiul privat al aplicației, scope `drive.appdata`), fișier JSON sau CSV.
+- **Salvare automată în Drive** (opțională, Setări): fiecare modificare se trimite în Drive după ~2 secunde. Google cere reconectarea o dată pe sesiune / oră (buton „Conectează Drive”). Dacă copia din Drive a fost schimbată de pe alt dispozitiv, aplicația nu o suprascrie și te întreabă ce păstrezi.
 - **Curs EUR → RON:** la plăți noi se încearcă cursul BNR; dacă browserul nu îl poate accesa (BNR nu permite de obicei cereri din alte site-uri), se folosește cursul BCE prin [Frankfurter](https://frankfurter.dev). Cursul poate fi introdus manual. La editarea unei plăți cursul salvat nu se schimbă automat.
 - **Moduri de calcul:** curs de referință unic (setat în Setări) sau cursul salvat pe fiecare plată.
 - **Bugete:** în RON, setate pe fiecare categorie (Categorii → Buget).

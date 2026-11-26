@@ -49,7 +49,7 @@ summary:focus-visible{outline:3px solid #3486ce;outline-offset:-4px}
 /* ---- v2 additions ---- */
 .neg{color:var(--danger)!important}
 .backup-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:16px}
-.backup-banner .actions .btn{background:#fff}
+.backup-banner .actions .btn:not(.btn-primary){background:#fff}
 .backup-ok{font-size:13px;color:var(--muted);margin:-8px 0 14px}
 .bar-fill.over{background:linear-gradient(90deg,#d92d20,var(--danger))}
 .bar-fill.nobudget{background:linear-gradient(90deg,#8aa4c4,#b6c8de)}
@@ -70,6 +70,8 @@ summary:focus-visible{outline:3px solid #3486ce;outline-offset:-4px}
 .btn-row{display:flex;gap:8px;flex-wrap:wrap}
 .btn:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none}
 .filter-empty{display:flex;flex-direction:column;align-items:center;gap:10px}
+.auto-sync-row{margin:4px 0 6px;font-size:14px;align-items:flex-start}.auto-sync-row input{margin-top:3px;width:18px;height:18px}
+.sync-ok{margin:0 0 12px}
 #askDialog{width:min(480px,calc(100vw - 28px))}
 #askMessage{margin-top:0;line-height:1.55}
 @media(max-width:650px){
@@ -85,6 +87,7 @@ summary:focus-visible{outline:3px solid #3486ce;outline-offset:-4px}
 <body>
 <header class="topbar"><div class="topbar-inner"><div class="brand"><div class="brand-mark" aria-hidden="true"><svg width="28" height="28" viewBox="0 0 32 32" fill="none" stroke="white" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="M3 15.5 16 5l13 10.5M6.5 14v12h19V14M13 26v-8h6v8"/></svg></div><div><div class="brand-title">Cheltuieli construcție casă</div><div class="brand-subtitle">Evidența plăților pe categorii</div></div></div><div class="top-actions"><label for="globalRateMode" class="sr-only">Mod de calcul</label><select id="globalRateMode" class="btn mode-select" title="Mod de calcul al conversiei"></select><button id="quickAddBtn" class="btn btn-primary" data-action="add-payment">Adaugă plată</button></div></div><nav id="nav" class="nav" aria-label="Secțiuni"></nav></header>
 <main class="container">
+<div id="syncBar" aria-live="polite"></div>
 
 <section id="page-dashboard" class="page active">
 <div class="page-head"><div><h1>Dashboard</h1><p>Imagine de ansamblu asupra cheltuielilor de construcție.</p></div><div class="actions"><button class="btn btn-primary" data-action="add-payment">Adaugă plată</button><button class="btn btn-blue" data-action="open-pdf">Export PDF</button></div></div>
@@ -131,7 +134,9 @@ summary:focus-visible{outline:3px solid #3486ce;outline-offset:-4px}
 <div class="card card-pad"><h2 class="section-title">Backup</h2>
 <div id="settingsBackupStatus" class="settings-note"></div>
 <h3 class="settings-sub">Google Drive (privat)</h3>
-<p class="settings-note">Se păstrează o singură copie în spațiul privat al aplicației din contul tău Google, actualizată la fiecare salvare. Sincronizarea este manuală.</p>
+<p class="settings-note">Se păstrează o singură copie în spațiul privat al aplicației din contul tău Google.</p>
+<label class="check-row auto-sync-row"><input type="checkbox" id="autoSyncToggle"><span><strong>Salvare automată în Drive</strong> după fiecare modificare</span></label>
+<p class="settings-note">Google cere reconectarea o dată pe sesiune (și aproximativ o dată pe oră). Când e nevoie, apare un buton „Conectează Drive” sus în pagină. Dacă datele din Drive au fost schimbate de pe alt dispozitiv, aplicația te întreabă ce păstrezi în loc să le suprascrie.</p>
 <div class="btn-row"><button type="button" class="btn btn-primary" id="driveSave">Salvează în Drive</button><button type="button" class="btn" id="driveLoad">Încarcă din Drive</button></div>
 <p id="driveStatus" class="settings-note" role="status" style="margin-top:10px"></p>
 <div class="hr"></div>
