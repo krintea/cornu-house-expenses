@@ -1,0 +1,58 @@
+name: Import app ZIP
+on:
+  push:
+    branches: [main]
+    paths: ['cornu-house-expenses-*.zip']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: import-app-zip
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate and extract app
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, zipfile, re
+          root = pathlib.Path('.')
+          archives = sorted(root.glob('cornu-house-expenses-*.zip'), key=lambda p: p.stat().st_mtime)
+          if len(archives) != 1:
+              raise SystemExit('Upload exactly one app ZIP in the repository root.')
+          archive = archives[0]
+          allowed = {'index.html','app.js','docreader.js','README.md','fonts','vendor'}
+          with zipfile.ZipFile(archive) as z:
+              entries = [i for i in z.infolist() if not i.is_dir()]
+              if sum(i.file_size for i in entries) > 100_000_000:
+                  raise SystemExit('Archive exceeds size limit')
+              names = set()
+              for i in entries:
+                  p = pathlib.PurePosixPath(i.filename)
+                  if p.is_absolute() or '..' in p.parts or not p.parts or p.parts[0] not in allowed or '\\' in i.filename:
+                      raise SystemExit('Unexpected archive path: '+i.filename)
+                  if p.parts[0] not in {'fonts','vendor'} and len(p.parts) != 1:
+                      raise SystemExit('Unexpected nested path')
+                  if p.suffix.lower() in {'.json','.env','.pem','.key','.zip'}:
+                      raise SystemExit('Potentially sensitive file: '+i.filename)
+                  names.add(i.filename)
+              if not {'index.html','app.js','docreader.js'}.issubset(names):
+                  raise SystemExit('Missing app files')
+              for i in entries:
+                  p = root / i.filename
+                  p.parent.mkdir(parents=True, exist_ok=True)
+                  p.write_bytes(z.read(i))
+          archive.unlink()
+          PY
+          node --check app.js
+          node --check docreader.js
+      - name: Commit imported files
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --quiet || git commit -m "Import application ZIP"
+          git push origin HEAD:main
